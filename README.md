@@ -11,6 +11,8 @@ Any of these can be turned on in the settings:
 - OBS Studio is streaming, and optionally recording or running its virtual camera, read through OBS WebSocket (`ws://127.0.0.1:4455` by default, with an optional password).
 - A PipeWire screen capture is running, read from a small local helper (`http://127.0.0.1:28282` by default) that reports capture state.
 
+Link previews are covered too. With text concealing on, a preview's title, description, author, footer and fields are hidden behind one spoiler. With link preview concealing on, so are previews whose author or footer has an icon; otherwise only the preview's image or video is covered.
+
 It can also switch Discord's Streamer Mode on when one of these starts and off again when it ends. If you turn Streamer Mode off yourself during a stream, it stays off. The plugin remembers across reloads that it turned Streamer Mode on, so a crash mid stream doesn't leave it on for good.
 
 ## Connections

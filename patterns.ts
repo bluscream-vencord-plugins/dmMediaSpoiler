@@ -15,12 +15,14 @@ export const PATTERNS = {
         renderAttachments: /(?<=renderAttachments\((\i)\)\{)/,
         /** The one call site of the sticker renderer, capturing the message. */
         stickersCall: /(?<==)this\.renderStickersAccessories\((\i)\)/,
+        /** The one call site of the embed (link preview) renderer, capturing the message. */
+        embedsCall: /(?<==)this\.renderEmbeds\((\i)\)/,
         /** The message content renderer. */
         contentFind: "!1,hideSimpleEmbedContent",
         /** The parsed content variable just before it is returned. */
         content: /(?<=let (\i)=\i;)(?=return null!=\i&&\(\1=\i\(\1,\i\)\),\1\})/,
         /** The module with Discord's obscure-reason helpers for embeds and attachments. */
-        embedFind: "author.bot&&",
+        embedFind: ".POTENTIAL_EXPLICIT_CONTENT]:",
         /** The embed helper's "is a spoiler" flag right before it returns SPOILER. */
         embedSpoiler: /(?<=\.Embed,media:\i\},\i\);return .{0,80}?:)(\i)(?=\?\i\.\i\.SPOILER:null)/
     },

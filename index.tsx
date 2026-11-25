@@ -86,9 +86,21 @@ function concealsIn(channel: Channel | undefined): boolean {
 
 const channelOf = (message: Message) => ChannelStore.getChannel(message.channel_id ?? SelectedChannelStore.getChannelId());
 
-function shouldSpoilerEmbed(embed: Message["embeds"][number], message: Message): boolean {
+type Embed = Message["embeds"][number];
+
+const embedHasText = (embed: Embed) => !!(embed.rawTitle || embed.rawDescription || embed.author?.name || embed.footer?.text || embed.provider?.name || embed.fields?.length);
+const embedHasIcon = (embed: Embed) => !!(embed.author?.iconURL || embed.footer?.iconURL);
+
+function concealsWholeEmbeds(message: Message, channel: Channel | undefined): boolean {
+    const { text, linkPreviews } = settings.store.conceal;
+    if ((!text && !linkPreviews) || !message.embeds?.length || !concealsIn(channel)) return false;
+    return message.embeds.some(embed => (text && embedHasText(embed)) || (linkPreviews && embedHasIcon(embed)));
+}
+
+function shouldSpoilerEmbed(embed: Embed, message: Message): boolean {
     if (!settings.store.conceal.linkPreviews || (embed.image == null && embed.video == null && embed.thumbnail == null && !embed.images?.length)) return false;
-    return concealsIn(channelOf(message));
+    const channel = channelOf(message);
+    return concealsIn(channel) && !concealsWholeEmbeds(message, channel);
 }
 
 function isConcealedAttachment(attachment: MessageAttachment) {
@@ -143,6 +155,10 @@ function spoilerContent(ast: ASTNode[], message: Message): ASTNode[] {
 
 const StickerSpoiler = ErrorBoundary.wrap(({ stickers }: { stickers: ReactNode; }) => (
     <Spoiler type="attachment" inline={false}>{() => stickers}</Spoiler>
+), { noop: true });
+
+const EmbedsSpoiler = ErrorBoundary.wrap(({ embeds }: { embeds: ReactNode; }) => (
+    <Spoiler type="embed" inline={false}>{() => embeds}</Spoiler>
 ), { noop: true });
 
 const retryWatchers = lodash.throttle(() => {
@@ -286,6 +302,10 @@ export default definePlugin({
             {
                 match: PATTERNS.webpack.stickersCall,
                 replace: "$self.wrapStickers($&,$1,this.props.channel)"
+            },
+            {
+                match: PATTERNS.webpack.embedsCall,
+                replace: "$self.wrapEmbeds($&,$1,this.props.channel)"
             }
         ]
     }, {
@@ -305,6 +325,11 @@ export default definePlugin({
     wrapStickers(stickers: ReactNode, message: Message, channel: Channel) {
         if (stickers == null || !settings.store.conceal.stickers || !message.stickerItems.length || !concealsIn(channel)) return stickers;
         return <StickerSpoiler stickers={stickers} />;
+    },
+
+    wrapEmbeds(embeds: ReactNode, message: Message, channel: Channel) {
+        if (embeds == null || !concealsWholeEmbeds(message, channel)) return embeds;
+        return <EmbedsSpoiler embeds={embeds} />;
     },
 
     withSpoilerAttachments,
