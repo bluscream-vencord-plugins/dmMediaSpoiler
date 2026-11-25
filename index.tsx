@@ -6,6 +6,7 @@
 
 import { migratePluginSetting } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
+import { proxyLazy } from "@utils/lazy";
 import definePlugin from "@utils/types";
 import { Channel, Message, MessageAttachment } from "@vencord/discord-types";
 import { findComponentByCodeLazy } from "@webpack";
@@ -161,10 +162,10 @@ const EmbedsSpoiler = ErrorBoundary.wrap(({ embeds }: { embeds: ReactNode; }) =>
     <Spoiler type="embed" inline={false}>{() => embeds}</Spoiler>
 ), { noop: true });
 
-const retryWatchers = lodash.throttle(() => {
+const retryWatchers = proxyLazy(() => lodash.throttle(() => {
     pipewire?.retryNow();
     obs?.retryNow();
-}, 5000);
+}, 5000));
 
 function onStoreChange() {
     refreshConceal();
@@ -212,17 +213,17 @@ function updateWatchers() {
     refreshConceal();
 }
 
-const restartPipewire = lodash.debounce(() => {
+const restartPipewire = proxyLazy(() => lodash.debounce(() => {
     if (!pipewire) return;
     pipewire.stop();
     startPipewire();
-}, 1000);
+}, 1000));
 
-const restartObs = lodash.debounce(() => {
+const restartObs = proxyLazy(() => lodash.debounce(() => {
     if (!obs) return;
     obs.stop();
     startObs();
-}, 1000);
+}, 1000));
 
 function onSettingChange(key: SettingKey) {
     switch (key) {
