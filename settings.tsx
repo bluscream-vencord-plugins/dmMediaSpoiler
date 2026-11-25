@@ -8,22 +8,19 @@ import { definePluginSettings, SettingsStore } from "@api/Settings";
 import { BaseText } from "@components/BaseText";
 import ErrorBoundary from "@components/ErrorBoundary";
 import { SettingsSection } from "@components/settings/tabs/plugins/components/Common";
+import { parseUrl } from "@utils/misc";
 import { defineDefault, OptionType } from "@utils/types";
-import { Checkbox, MessageStore } from "@webpack/common";
+import { Checkbox } from "@webpack/common";
 
 import { pluginInfo } from "./info";
+import { PATTERNS } from "./patterns";
 
-export const emitChange = () => MessageStore.emitChange();
-
-let watchersCallback: (() => void) | null = null;
-export function registerWatchersCallback(cb: (() => void) | null) {
-    watchersCallback = cb;
+let settingsCallback: ((key: SettingKey) => void) | null = null;
+export function registerSettingsCallback(cb: ((key: SettingKey) => void) | null) {
+    settingsCallback = cb;
 }
 
-const onSettingChange = () => {
-    emitChange();
-    watchersCallback?.();
-};
+const onChange = (key: SettingKey) => () => settingsCallback?.(key);
 
 const CONCEAL_LABELS = {
     media: "Images and videos",
@@ -53,7 +50,7 @@ function ConcealCheckbox({ type }: { type: ConcealType; }) {
             value={conceal[type]}
             onChange={(_, value) => {
                 settings.store.conceal[type] = value;
-                emitChange();
+                settingsCallback?.("conceal");
             }}
             size={20}
         >
@@ -76,76 +73,90 @@ for (const [oldKey, type] of [["hideMediaLinkPreviews", "linkPreviews"], ["spoil
     SettingsStore.markAsChanged();
 }
 
+function validUrl(protocols: readonly string[]) {
+    return (value: string) => {
+        if (!value.trim()) return true;
+        const url = parseUrl(value.trim());
+        if (!url || !protocols.includes(url.protocol)) return `Enter an address starting with ${protocols.map(p => p + "//").join(" or ")}.`;
+        return true;
+    };
+}
+
 export const settings = definePluginSettings({
     concealInStreamerMode: {
         type: OptionType.BOOLEAN,
         description: "Conceal while Discord Streamer Mode is enabled.",
         default: true,
-        onChange: emitChange,
+        onChange: onChange("concealInStreamerMode"),
     },
     concealWhileStreaming: {
         type: OptionType.BOOLEAN,
         description: "Conceal while you have an active Discord stream, even when Streamer Mode is disabled.",
         default: true,
-        onChange: emitChange,
+        onChange: onChange("concealWhileStreaming"),
     },
     forceDiscordStreamerMode: {
         type: OptionType.BOOLEAN,
-        description: "Automatically enable Discord's native Streamer Mode whenever an active stream/screencast is detected.",
+        description: "Turn on Discord's Streamer Mode when a stream or screen capture starts, and off again when it ends.",
         default: true,
-        onChange: onSettingChange,
+        onChange: onChange("forceDiscordStreamerMode"),
     },
     detectPipewireWatcher: {
         type: OptionType.BOOLEAN,
-        description: "Conceal when an active screen capture is detected via the local PipeWire watcher daemon.",
+        description: "Conceal while the local PipeWire watcher helper reports a screen capture.",
         default: true,
-        onChange: onSettingChange,
+        onChange: onChange("detectPipewireWatcher"),
     },
     pipewireWatcherUrl: {
         type: OptionType.STRING,
-        description: "URL of the local PipeWire screencast watcher daemon.",
-        default: "http://127.0.0.1:28282",
-        onChange: onSettingChange,
+        description: "Address of the local PipeWire watcher helper.",
+        default: PATTERNS.pipewire.defaultUrl,
+        isValid: validUrl(PATTERNS.pipewire.protocols),
+        onChange: onChange("pipewireWatcherUrl"),
     },
     detectObs: {
         type: OptionType.BOOLEAN,
-        description: "Conceal when OBS Studio is actively streaming or recording (via OBS-WebSocket).",
+        description: "Conceal while OBS Studio is streaming, read through OBS WebSocket.",
         default: true,
-        onChange: onSettingChange,
+        onChange: onChange("detectObs"),
     },
     obsAddress: {
         type: OptionType.STRING,
-        description: "OBS-WebSocket address (default in OBS v28+ is ws://127.0.0.1:4455).",
-        default: "ws://127.0.0.1:4455",
-        onChange: onSettingChange,
+        description: "OBS WebSocket address. OBS 28 and newer use ws://127.0.0.1:4455 by default.",
+        default: PATTERNS.obs.defaultAddress,
+        isValid: validUrl(PATTERNS.obs.protocols),
+        onChange: onChange("obsAddress"),
     },
     obsPassword: {
         type: OptionType.STRING,
-        description: "OBS-WebSocket password (leave blank if password is disabled in OBS Tools -> WebSocket Server Settings).",
+        description: "OBS WebSocket password. Leave it empty when authentication is off in OBS's WebSocket Server Settings.",
         default: "",
-        onChange: onSettingChange,
+        onChange: onChange("obsPassword"),
     },
     obsIncludeRecording: {
         type: OptionType.BOOLEAN,
         description: "Also conceal while recording locally in OBS.",
         default: false,
-        onChange: onSettingChange,
+        onChange: onChange("obsIncludeRecording"),
     },
     obsIncludeVirtualCam: {
         type: OptionType.BOOLEAN,
-        description: "Also conceal while OBS Virtual Camera is running.",
+        description: "Also conceal while the OBS Virtual Camera is running.",
         default: false,
-        onChange: onSettingChange,
+        onChange: onChange("obsIncludeVirtualCam"),
     },
     conceal: {
         type: OptionType.COMPONENT,
         component: ConcealSettings,
-        default: defineDefault(DEFAULT_CONCEAL),
+        default: defineDefault({ ...DEFAULT_CONCEAL }),
     },
     includeGroupDms: {
         type: OptionType.BOOLEAN,
         description: "Also conceal in group DMs.",
         default: true,
-        onChange: emitChange,
+        onChange: onChange("includeGroupDms"),
     },
-});
+}).withPrivateSettings<{ streamerModeEnabledByPlugin?: boolean; }>();
+
+export type SettingKey = "concealInStreamerMode" | "concealWhileStreaming" | "forceDiscordStreamerMode" | "detectPipewireWatcher"
+    | "pipewireWatcherUrl" | "detectObs" | "obsAddress" | "obsPassword" | "obsIncludeRecording" | "obsIncludeVirtualCam" | "conceal" | "includeGroupDms";

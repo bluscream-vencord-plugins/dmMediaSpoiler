@@ -4,13 +4,39 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { createBackoff } from "./backoff";
+import { Logger } from "@utils/Logger";
+
+import { createBackoff, DISCONNECT_GRACE_MS, Watcher } from "./backoff";
+import { PATTERNS } from "./patterns";
+
+const logger = new Logger("DmMediaSpoiler");
+const { op: OP, outputs: OUTPUTS } = PATTERNS.obs;
+
+type Output = keyof typeof OUTPUTS;
 
 export interface ObsWatcherOptions {
     getAddress: () => string;
     getPassword: () => string;
     includeRecording: () => boolean;
     includeVirtualCam: () => boolean;
+}
+
+interface ObsMessage {
+    op: number;
+    d: Record<string, unknown>;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+
+function parseMessage(data: unknown): ObsMessage | null {
+    if (typeof data !== "string") return null;
+    try {
+        const message: unknown = JSON.parse(data);
+        if (isRecord(message) && typeof message.op === "number" && isRecord(message.d)) return { op: message.op, d: message.d };
+    } catch (err) {
+        logger.debug("Ignoring a malformed OBS message", err);
+    }
+    return null;
 }
 
 async function computeObsAuth(password: string, salt: string, challenge: string): Promise<string> {
@@ -21,163 +47,133 @@ async function computeObsAuth(password: string, salt: string, challenge: string)
     return btoa(String.fromCharCode(...new Uint8Array(authHash)));
 }
 
-export function startObsWatcher(
-    options: ObsWatcherOptions,
-    onStateChange: (active: boolean) => void
-): () => void {
-    let active = true;
+export function startObsWatcher(options: ObsWatcherOptions, onStateChange: (active: boolean) => void): Watcher {
+    let running = true;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
     const backoff = createBackoff();
-
-    let isStreaming = false;
-    let isRecording = false;
-    let isVirtualCam = false;
+    const state: Record<Output, boolean> = { stream: false, record: false, virtualCam: false };
     let lastActive: boolean | null = null;
 
     function evaluateActive() {
-        const currentlyActive = isStreaming
-            || (options.includeRecording() && isRecording)
-            || (options.includeVirtualCam() && isVirtualCam);
-
-        if (currentlyActive !== lastActive) {
-            lastActive = currentlyActive;
-            onStateChange(currentlyActive);
-        }
+        const active = state.stream
+            || (options.includeRecording() && state.record)
+            || (options.includeVirtualCam() && state.virtualCam);
+        if (active === lastActive) return;
+        lastActive = active;
+        onStateChange(active);
     }
 
     function resetState() {
-        isStreaming = false;
-        isRecording = false;
-        isVirtualCam = false;
+        state.stream = state.record = state.virtualCam = false;
         evaluateActive();
     }
 
+    function clearGrace() {
+        if (graceTimer != null) clearTimeout(graceTimer);
+        graceTimer = null;
+    }
+
+    function connectionLost() {
+        ws = null;
+        if (lastActive && graceTimer == null) graceTimer = setTimeout(() => {
+            graceTimer = null;
+            resetState();
+        }, DISCONNECT_GRACE_MS);
+        else if (!lastActive) resetState();
+        scheduleReconnect();
+    }
+
     function scheduleReconnect() {
-        if (!active || reconnectTimer != null) return;
+        if (!running || reconnectTimer != null) return;
         reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
             connect();
         }, backoff.next());
     }
 
-    function sendOp(op: number, d: Record<string, unknown>) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ op, d }));
+    function setOutput(output: Output, data: unknown) {
+        if (!isRecord(data)) return;
+        state[output] = Boolean(data.outputActive);
+        evaluateActive();
+    }
+
+    async function onMessage(socket: WebSocket, message: ObsMessage) {
+        const { op, d } = message;
+        const send = (sendOp: number, payload: Record<string, unknown>) => {
+            if (ws === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ op: sendOp, d: payload }));
+        };
+
+        if (op === OP.hello) {
+            const auth = d.authentication;
+            const password = options.getPassword();
+            const authentication = isRecord(auth) && password && typeof auth.salt === "string" && typeof auth.challenge === "string"
+                ? await computeObsAuth(password, auth.salt, auth.challenge)
+                : undefined;
+            send(OP.identify, { rpcVersion: PATTERNS.obs.rpcVersion, authentication, eventSubscriptions: PATTERNS.obs.eventSubscriptions });
+        } else if (op === OP.identified) {
+            backoff.reset();
+            for (const { request, id } of Object.values(OUTPUTS)) send(OP.request, { requestType: request, requestId: id });
+        } else if (op === OP.requestResponse) {
+            const output = (Object.keys(OUTPUTS) as Output[]).find(key => OUTPUTS[key].id === d.requestId);
+            if (output) {
+                clearGrace();
+                setOutput(output, d.responseData);
+            }
+        } else if (op === OP.event) {
+            const output = (Object.keys(OUTPUTS) as Output[]).find(key => OUTPUTS[key].event === d.eventType);
+            if (output) setOutput(output, d.eventData);
         }
     }
 
     function connect() {
-        if (!active) return;
-        resetState();
-
-        const address = options.getAddress().trim() || "ws://127.0.0.1:4455";
+        if (!running) return;
+        const address = options.getAddress().trim() || PATTERNS.obs.defaultAddress;
+        let socket: WebSocket;
         try {
-            ws = new WebSocket(address);
-        } catch {
-            scheduleReconnect();
+            socket = new WebSocket(address);
+        } catch (err) {
+            logger.warn("Can't connect to OBS at", address, err);
+            connectionLost();
             return;
         }
+        ws = socket;
 
-        ws.onopen = () => {
-            // Wait for Op 0 (Hello) from server
+        socket.onmessage = event => {
+            if (ws !== socket) return;
+            const message = parseMessage(event.data);
+            if (message) onMessage(socket, message).catch(err => logger.warn("Handling an OBS message failed", err));
         };
-
-        ws.onmessage = async event => {
-            try {
-                const message = JSON.parse(event.data as string);
-                const { op, d } = message;
-
-                if (op === 0) {
-                    // Op 0: Hello
-                    let authResponse: string | undefined;
-                    if (d?.authentication) {
-                        const pass = options.getPassword();
-                        if (pass) {
-                            authResponse = await computeObsAuth(pass, d.authentication.salt, d.authentication.challenge);
-                        }
-                    }
-
-                    // Op 1: Identify
-                    // Event subscription 33 = General (1) + Outputs (32)
-                    sendOp(1, {
-                        rpcVersion: 1,
-                        authentication: authResponse,
-                        eventSubscriptions: 33,
-                    });
-                } else if (op === 2) {
-                    // Op 2: Identified, so the connection works: start the next reconnect from the shortest delay again.
-                    backoff.reset();
-                    // Query current output states
-                    sendOp(6, { requestType: "GetStreamStatus", requestId: "dmms-stream" });
-                    sendOp(6, { requestType: "GetRecordStatus", requestId: "dmms-record" });
-                    sendOp(6, { requestType: "GetVirtualCamStatus", requestId: "dmms-vcam" });
-                } else if (op === 7) {
-                    // Op 7: RequestResponse
-                    if (d?.requestId === "dmms-stream" && d?.responseData) {
-                        isStreaming = Boolean(d.responseData.outputActive);
-                        evaluateActive();
-                    } else if (d?.requestId === "dmms-record" && d?.responseData) {
-                        isRecording = Boolean(d.responseData.outputActive);
-                        evaluateActive();
-                    } else if (d?.requestId === "dmms-vcam" && d?.responseData) {
-                        isVirtualCam = Boolean(d.responseData.outputActive);
-                        evaluateActive();
-                    }
-                } else if (op === 5) {
-                    // Op 5: Event
-                    if (d?.eventType === "StreamStateChanged" && d?.eventData) {
-                        isStreaming = Boolean(d.eventData.outputActive);
-                        evaluateActive();
-                    } else if (d?.eventType === "RecordStateChanged" && d?.eventData) {
-                        isRecording = Boolean(d.eventData.outputActive);
-                        evaluateActive();
-                    } else if (d?.eventType === "VirtualcamStateChanged" && d?.eventData) {
-                        isVirtualCam = Boolean(d.eventData.outputActive);
-                        evaluateActive();
-                    }
-                }
-            } catch {
-                // Ignore parsing errors
-            }
+        socket.onclose = () => {
+            if (ws === socket) connectionLost();
         };
-
-        ws.onclose = () => {
-            ws = null;
-            resetState();
-            scheduleReconnect();
-        };
-
-        ws.onerror = () => {
-            if (ws) {
-                try {
-                    ws.close();
-                } catch {
-                    // Ignore
-                }
-                ws = null;
-            }
-            resetState();
-            scheduleReconnect();
+        socket.onerror = () => {
+            if (ws !== socket) return;
+            socket.close();
+            connectionLost();
         };
     }
 
     connect();
 
-    return () => {
-        active = false;
-        if (reconnectTimer != null) {
+    return {
+        stop() {
+            running = false;
+            if (reconnectTimer != null) clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+            clearGrace();
+            const socket = ws;
+            ws = null;
+            socket?.close();
+            resetState();
+        },
+        refresh: evaluateActive,
+        retryNow() {
+            if (!running || reconnectTimer == null) return;
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
+            connect();
         }
-        if (ws) {
-            try {
-                ws.close();
-            } catch {
-                // Ignore
-            }
-            ws = null;
-        }
-        resetState();
     };
 }

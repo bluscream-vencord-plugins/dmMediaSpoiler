@@ -4,18 +4,12 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-/** The longest delay setTimeout accepts; anything longer fires immediately instead. */
 const MAX_TIMEOUT = 2 ** 31 - 1;
 
-/**
- * Reconnect delays that double after every failure, starting at `min` with no upper limit, and start over once a
- * connection works. Keeps a service that isn't running (OBS closed, no PipeWire helper) from being retried every few
- * seconds forever.
- */
+/** Delays that double after every failure with no upper limit, and start over once a connection works. */
 export function createBackoff(min = 1000) {
     let delay = min;
     return {
-        /** The delay before the next attempt; each call doubles the one after it. */
         next() {
             const current = Math.min(delay, MAX_TIMEOUT);
             delay *= 2;
@@ -25,4 +19,14 @@ export function createBackoff(min = 1000) {
             delay = min;
         }
     };
+}
+
+/** How long a lost connection keeps the last "active" state before it counts as inactive. */
+export const DISCONNECT_GRACE_MS = 15_000;
+
+/** What a watcher hands back: stop it, re-evaluate its options, or retry a pending reconnect right away. */
+export interface Watcher {
+    stop(): void;
+    refresh?(): void;
+    retryNow(): void;
 }

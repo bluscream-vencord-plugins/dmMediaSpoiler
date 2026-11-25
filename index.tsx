@@ -9,13 +9,15 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin from "@utils/types";
 import { Channel, Message, MessageAttachment } from "@vencord/discord-types";
 import { findComponentByCodeLazy } from "@webpack";
-import { ApplicationStreamingStore, ChannelStore, FluxDispatcher, MessageStore, SelectedChannelStore, StreamerModeStore } from "@webpack/common";
+import { ApplicationStreamingStore, ChannelStore, FluxDispatcher, lodash, MessageStore, SelectedChannelStore, StreamerModeStore } from "@webpack/common";
 import type { ReactNode } from "react";
 
+import { Watcher } from "./backoff";
 import { pluginInfo } from "./info";
 import { startObsWatcher } from "./obs";
+import { PATTERNS } from "./patterns";
 import { startPipewireWatcher } from "./pipewire";
-import { registerWatchersCallback, settings } from "./settings";
+import { registerSettingsCallback, SettingKey, settings } from "./settings";
 
 export { pluginInfo };
 
@@ -25,11 +27,7 @@ interface SpoilerProps {
     children(hidden: boolean): ReactNode;
 }
 
-const Spoiler = findComponentByCodeLazy<SpoilerProps>("shouldAgeVerify:", "isVerifiedTeen:");
-
-// Discord's AttachmentFlags.IS_SPOILER bitmask (1 << 3 = 8). Modern Discord checks
-// `(attachment.flags ?? 0) & 8` in getObscureReason, rather than just `attachment.spoiler`.
-const ATTACHMENT_FLAG_IS_SPOILER = 8;
+const Spoiler = findComponentByCodeLazy<SpoilerProps>(...PATTERNS.webpack.spoilerComponent);
 
 type FlaggedAttachment = MessageAttachment & { flags?: number; };
 
@@ -37,102 +35,82 @@ migratePluginSetting(pluginInfo.name, "concealInStreamerMode", "onlyWhenStreamer
 
 let isPipewireStreaming = false;
 let isObsStreaming = false;
-let stopPipewire: (() => void) | null = null;
-let stopObs: (() => void) | null = null;
-let wasStreamerModeEnabledByPlugin = false;
+let pipewire: Watcher | null = null;
+let obs: Watcher | null = null;
+let wasStreaming = false;
+let concealActive = false;
+let concealGeneration = 0;
+const spoileredMessages = new WeakMap<Message, { generation: number; message: Message; }>();
 
 function isAnyStreamingActive(): boolean {
-    const {
-        detectPipewireWatcher,
-        detectObs,
-        concealWhileStreaming,
-    } = settings.store;
-
+    const { detectPipewireWatcher, detectObs, concealWhileStreaming } = settings.store;
     return (detectPipewireWatcher && isPipewireStreaming)
         || (detectObs && isObsStreaming)
         || (concealWhileStreaming && ApplicationStreamingStore.getCurrentUserActiveStream() != null);
 }
 
+function setStreamerMode(value: boolean) {
+    FluxDispatcher.dispatch({ type: PATTERNS.streamerModeUpdate, key: "enabled", value });
+}
+
 function updateDiscordStreamerMode() {
-    if (!settings.store.forceDiscordStreamerMode) {
-        if (wasStreamerModeEnabledByPlugin) {
-            wasStreamerModeEnabledByPlugin = false;
-            if (StreamerModeStore.enabled) {
-                FluxDispatcher.dispatch({
-                    type: "STREAMER_MODE_UPDATE",
-                    key: "enabled",
-                    value: false,
-                });
-            }
-        }
-        return;
-    }
-
     const streaming = isAnyStreamingActive();
-    if (streaming) {
-        if (!StreamerModeStore.enabled) {
-            wasStreamerModeEnabledByPlugin = true;
-            FluxDispatcher.dispatch({
-                type: "STREAMER_MODE_UPDATE",
-                key: "enabled",
-                value: true,
-            });
-        }
-    } else if (wasStreamerModeEnabledByPlugin) {
-        wasStreamerModeEnabledByPlugin = false;
-        if (StreamerModeStore.enabled) {
-            FluxDispatcher.dispatch({
-                type: "STREAMER_MODE_UPDATE",
-                key: "enabled",
-                value: false,
-            });
-        }
+    const force = settings.store.forceDiscordStreamerMode;
+
+    if (force && streaming && !wasStreaming && !StreamerModeStore.enabled) {
+        settings.store.streamerModeEnabledByPlugin = true;
+        setStreamerMode(true);
+    } else if ((!force || !streaming) && settings.store.streamerModeEnabledByPlugin) {
+        settings.store.streamerModeEnabledByPlugin = false;
+        if (StreamerModeStore.enabled) setStreamerMode(false);
     }
+    wasStreaming = streaming;
 }
 
-function shouldConcealMessageMedia(channel: Channel): boolean {
-    const {
-        concealInStreamerMode,
-        concealWhileStreaming,
-        includeGroupDms,
-        detectPipewireWatcher,
-        detectObs,
-    } = settings.store;
-
-    const externalActive = (detectPipewireWatcher && isPipewireStreaming)
-        || (detectObs && isObsStreaming);
-
-    const active = (concealInStreamerMode && StreamerModeStore.enabled)
-        || (concealWhileStreaming && ApplicationStreamingStore.getCurrentUserActiveStream() != null)
-        || externalActive;
-
-    return active && (channel.isDM() || (includeGroupDms && channel.isGroupDM()));
+function invalidate() {
+    concealGeneration++;
+    MessageStore.emitChange();
 }
 
-// Forwarded message snapshots carry no channel_id, so fall back to the channel being viewed.
+function refreshConceal() {
+    updateDiscordStreamerMode();
+    const active = (settings.store.concealInStreamerMode && StreamerModeStore.enabled) || isAnyStreamingActive();
+    if (active === concealActive) return;
+    concealActive = active;
+    invalidate();
+}
+
+function concealsIn(channel: Channel | undefined): boolean {
+    return concealActive && channel != null && (channel.isDM() || (settings.store.includeGroupDms && channel.isGroupDM()));
+}
+
+const channelOf = (message: Message) => ChannelStore.getChannel(message.channel_id ?? SelectedChannelStore.getChannelId());
+
 function shouldSpoilerEmbed(embed: Message["embeds"][number], message: Message): boolean {
     if (!settings.store.conceal.linkPreviews || (embed.image == null && embed.video == null && embed.thumbnail == null && !embed.images?.length)) return false;
-
-    const channel = ChannelStore.getChannel(message.channel_id ?? SelectedChannelStore.getChannelId());
-    return channel != null && shouldConcealMessageMedia(channel);
+    return concealsIn(channelOf(message));
 }
 
-function shouldSpoilerStickers(message: Message, channel: Channel): boolean {
-    return settings.store.conceal.stickers && message.stickerItems.length > 0 && shouldConcealMessageMedia(channel);
+function isConcealedAttachment(attachment: MessageAttachment) {
+    const isMedia = attachment.content_type
+        ? PATTERNS.mediaContentType.test(attachment.content_type)
+        : PATTERNS.mediaFileName.test(attachment.filename);
+    return settings.store.conceal[isMedia ? "media" : "files"];
 }
-
-const isConcealedAttachment = (attachment: MessageAttachment) =>
-    settings.store.conceal[/^(?:image|video)\//.test(attachment.content_type ?? "") ? "media" : "files"];
 
 function withSpoilerAttachments(message: Message, channel: Channel): Message {
-    if (!message.attachments.some(isConcealedAttachment) || !shouldConcealMessageMedia(channel)) return message;
+    if (!concealsIn(channel) || !message.attachments.some(isConcealedAttachment)) return message;
 
-    const spoilered = Object.create(message) as Message;
-    spoilered.attachments = message.attachments.map((attachment: FlaggedAttachment) => isConcealedAttachment(attachment) ? {
+    const cached = spoileredMessages.get(message);
+    if (cached?.generation === concealGeneration) return cached.message;
+
+    const attachments = message.attachments.map((attachment: FlaggedAttachment) => isConcealedAttachment(attachment) ? {
         ...attachment,
         spoiler: true,
-        flags: (attachment.flags ?? 0) | ATTACHMENT_FLAG_IS_SPOILER,
+        flags: (attachment.flags ?? 0) | PATTERNS.attachmentSpoilerFlag,
     } : attachment);
+    const spoilered: Message = Object.create(message, { attachments: { value: attachments, enumerable: true } });
+    spoileredMessages.set(message, { generation: concealGeneration, message: spoilered });
     return spoilered;
 }
 
@@ -142,12 +120,12 @@ interface ASTNode {
     channelId?: string;
 }
 
-const spoilerNode = (content: ASTNode[], channelId: string): ASTNode => ({ type: "spoiler", content, channelId });
+const spoilerNode = (content: ASTNode[], channelId: string): ASTNode => ({ type: PATTERNS.ast.spoiler, content, channelId });
 
 function spoilerEmojis(nodes: ASTNode[], channelId: string): ASTNode[] {
     return nodes.map(node =>
-        node.type === "emoji" || node.type === "customEmoji" ? spoilerNode([node], channelId)
-            : node.type !== "spoiler" && Array.isArray(node.content) ? { ...node, content: spoilerEmojis(node.content, channelId) }
+        PATTERNS.ast.emojis.includes(node.type) ? spoilerNode([node], channelId)
+            : node.type !== PATTERNS.ast.spoiler && Array.isArray(node.content) ? { ...node, content: spoilerEmojis(node.content, channelId) }
                 : node
     );
 }
@@ -156,68 +134,108 @@ function spoilerContent(ast: ASTNode[], message: Message): ASTNode[] {
     const { text, emojis } = settings.store.conceal;
     if ((!text && !emojis) || !ast.length) return ast;
 
-    const channel = ChannelStore.getChannel(message.channel_id);
-    if (!channel || !shouldConcealMessageMedia(channel)) return ast;
+    const channel = channelOf(message);
+    if (!channel || !concealsIn(channel)) return ast;
 
     if (!text) return spoilerEmojis(ast, channel.id);
-    return ast.length === 1 && ast[0].type === "spoiler" ? ast : [spoilerNode(ast, channel.id)];
+    return ast.length === 1 && ast[0].type === PATTERNS.ast.spoiler ? ast : [spoilerNode(ast, channel.id)];
 }
 
 const StickerSpoiler = ErrorBoundary.wrap(({ stickers }: { stickers: ReactNode; }) => (
     <Spoiler type="attachment" inline={false}>{() => stickers}</Spoiler>
 ), { noop: true });
 
+const retryWatchers = lodash.throttle(() => {
+    pipewire?.retryNow();
+    obs?.retryNow();
+}, 5000);
+
 function onStoreChange() {
-    updateDiscordStreamerMode();
-    MessageStore.emitChange();
+    refreshConceal();
+    retryWatchers();
+}
+
+function onPipewireState(streaming: boolean) {
+    isPipewireStreaming = streaming;
+    refreshConceal();
+}
+
+function onObsState(active: boolean) {
+    isObsStreaming = active;
+    refreshConceal();
+}
+
+function startPipewire() {
+    pipewire = startPipewireWatcher(() => settings.store.pipewireWatcherUrl, onPipewireState);
+}
+
+function startObs() {
+    obs = startObsWatcher({
+        getAddress: () => settings.store.obsAddress,
+        getPassword: () => settings.store.obsPassword,
+        includeRecording: () => settings.store.obsIncludeRecording,
+        includeVirtualCam: () => settings.store.obsIncludeVirtualCam,
+    }, onObsState);
 }
 
 function updateWatchers() {
     if (settings.store.detectPipewireWatcher) {
-        if (!stopPipewire) {
-            stopPipewire = startPipewireWatcher(
-                () => settings.store.pipewireWatcherUrl,
-                streaming => {
-                    if (isPipewireStreaming !== streaming) {
-                        isPipewireStreaming = streaming;
-                        onStoreChange();
-                    }
-                }
-            );
-        }
+        if (!pipewire) startPipewire();
     } else {
-        stopPipewire?.();
-        stopPipewire = null;
-        if (isPipewireStreaming) {
-            isPipewireStreaming = false;
-            onStoreChange();
-        }
+        pipewire?.stop();
+        pipewire = null;
     }
 
     if (settings.store.detectObs) {
-        if (!stopObs) {
-            stopObs = startObsWatcher({
-                getAddress: () => settings.store.obsAddress,
-                getPassword: () => settings.store.obsPassword,
-                includeRecording: () => settings.store.obsIncludeRecording,
-                includeVirtualCam: () => settings.store.obsIncludeVirtualCam,
-            }, active => {
-                if (isObsStreaming !== active) {
-                    isObsStreaming = active;
-                    onStoreChange();
-                }
-            });
-        }
+        if (!obs) startObs();
     } else {
-        stopObs?.();
-        stopObs = null;
-        if (isObsStreaming) {
-            isObsStreaming = false;
-            onStoreChange();
-        }
+        obs?.stop();
+        obs = null;
     }
 
-    updateDiscordStreamerMode();
+    refreshConceal();
+}
+
+const restartPipewire = lodash.debounce(() => {
+    if (!pipewire) return;
+    pipewire.stop();
+    startPipewire();
+}, 1000);
+
+const restartObs = lodash.debounce(() => {
+    if (!obs) return;
+    obs.stop();
+    startObs();
+}, 1000);
+
+function onSettingChange(key: SettingKey) {
+    switch (key) {
+        case "pipewireWatcherUrl":
+            restartPipewire();
+            break;
+        case "obsAddress":
+        case "obsPassword":
+            restartObs();
+            break;
+        case "obsIncludeRecording":
+        case "obsIncludeVirtualCam":
+            obs?.refresh?.();
+            break;
+        case "detectPipewireWatcher":
+        case "detectObs":
+            updateWatchers();
+            break;
+        case "conceal":
+        case "includeGroupDms":
+            invalidate();
+            break;
+        default:
+            refreshConceal();
+    }
+}
+
+function onWindowFocus() {
+    retryWatchers();
 }
 
 export default definePlugin({
@@ -229,70 +247,67 @@ export default definePlugin({
     start() {
         StreamerModeStore.addChangeListener(onStoreChange);
         ApplicationStreamingStore.addChangeListener(onStoreChange);
-        registerWatchersCallback(updateWatchers);
+        window.addEventListener("focus", onWindowFocus);
+        registerSettingsCallback(onSettingChange);
         updateWatchers();
     },
 
     stop() {
         StreamerModeStore.removeChangeListener(onStoreChange);
         ApplicationStreamingStore.removeChangeListener(onStoreChange);
-        registerWatchersCallback(null);
-        stopPipewire?.();
-        stopPipewire = null;
-        stopObs?.();
-        stopObs = null;
+        window.removeEventListener("focus", onWindowFocus);
+        registerSettingsCallback(null);
+        retryWatchers.cancel();
+        restartPipewire.cancel();
+        restartObs.cancel();
+        pipewire?.stop();
+        pipewire = null;
+        obs?.stop();
+        obs = null;
 
-        if (wasStreamerModeEnabledByPlugin) {
-            wasStreamerModeEnabledByPlugin = false;
-            if (StreamerModeStore.enabled) {
-                FluxDispatcher.dispatch({
-                    type: "STREAMER_MODE_UPDATE",
-                    key: "enabled",
-                    value: false,
-                });
-            }
+        isPipewireStreaming = isObsStreaming = wasStreaming = false;
+        if (settings.store.streamerModeEnabledByPlugin) {
+            settings.store.streamerModeEnabledByPlugin = false;
+            if (StreamerModeStore.enabled) setStreamerMode(false);
         }
-
-        isPipewireStreaming = false;
-        isObsStreaming = false;
+        if (concealActive) {
+            concealActive = false;
+            invalidate();
+        }
     },
 
     patches: [{
-        // These checks run at Discord's message renderer boundary: no DOM observers, polling,
-        // cache mutation, or attachment-copy allocation for messages that do not match.
-        find: "this.renderAttachments(",
+        find: PATTERNS.webpack.accessoriesFind,
         replacement: [
             {
-                match: /(?<=renderAttachments\((\i)\)\{)/,
+                match: PATTERNS.webpack.renderAttachments,
                 replace: "$1=$self.withSpoilerAttachments($1,this.props.channel);"
             },
             {
-                match: /(?<=renderStickersAccessories\((\i)\)\{)/,
-                replace: "if(!arguments[1]&&$self.shouldSpoilerStickers($1,this.props.channel))return $self.renderStickerSpoiler(this.renderStickersAccessories($1,!0));"
+                match: PATTERNS.webpack.stickersCall,
+                replace: "$self.wrapStickers($&,$1,this.props.channel)"
             }
         ]
     }, {
-        find: "!1,hideSimpleEmbedContent",
+        find: PATTERNS.webpack.contentFind,
         replacement: {
-            match: /(?<=let (\i)=\i;)(?=return null!=\i&&\(\1=\i\(\1,\i\)\),\1\})/,
+            match: PATTERNS.webpack.content,
             replace: "$1=$self.spoilerContent($1,arguments[1]);"
         }
     }, {
-        // Discord's own embed obscure-reason helper. Returning SPOILER here makes Discord render
-        // its native blurred embed spoiler, exactly as for a link inside ||spoiler|| text.
-        find: "author.bot&&",
+        find: PATTERNS.webpack.embedFind,
         replacement: {
-            match: /(?<=\.Embed,media:\i\},\i\);return .{0,80}?:)(\i)(?=\?\i\.\i\.SPOILER:null)/,
+            match: PATTERNS.webpack.embedSpoiler,
             replace: "($1||$self.shouldSpoilerEmbed(arguments[0],arguments[1]))"
         }
     }],
 
-    renderStickerSpoiler(stickers: ReactNode) {
-        return stickers == null ? null : <StickerSpoiler stickers={stickers} />;
+    wrapStickers(stickers: ReactNode, message: Message, channel: Channel) {
+        if (stickers == null || !settings.store.conceal.stickers || !message.stickerItems.length || !concealsIn(channel)) return stickers;
+        return <StickerSpoiler stickers={stickers} />;
     },
 
     withSpoilerAttachments,
     shouldSpoilerEmbed,
-    shouldSpoilerStickers,
     spoilerContent,
 });

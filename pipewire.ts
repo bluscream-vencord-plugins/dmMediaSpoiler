@@ -4,103 +4,155 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { createBackoff } from "./backoff";
+import { Logger } from "@utils/Logger";
 
-/** How often /status is polled while the event stream is down and the helper does answer. */
+import { createBackoff, DISCONNECT_GRACE_MS, Watcher } from "./backoff";
+import { PATTERNS } from "./patterns";
+
+const logger = new Logger("DmMediaSpoiler");
 const POLL_INTERVAL = 3000;
 
-export function startPipewireWatcher(
-    getUrl: () => string,
-    onStateChange: (streaming: boolean) => void
-): () => void {
-    let active = true;
+function readStreaming(data: unknown): boolean | null {
+    return typeof data === "object" && data !== null && "streaming" in data && typeof data.streaming === "boolean" ? data.streaming : null;
+}
+
+export function startPipewireWatcher(getUrl: () => string, onStateChange: (streaming: boolean) => void): Watcher {
+    let running = true;
     let eventSource: EventSource | null = null;
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
     let sseTimer: ReturnType<typeof setTimeout> | null = null;
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    let polling = false;
+    let fetchAbort: AbortController | null = null;
     let lastStreaming: boolean | null = null;
-    // Retries double while the helper isn't reachable, and start over once it answers.
     const sseBackoff = createBackoff();
     const pollBackoff = createBackoff(POLL_INTERVAL);
 
-    const baseUrl = () => (getUrl() || "http://127.0.0.1:28282").replace(/\/+$/, "");
+    const baseUrl = () => (getUrl().trim() || PATTERNS.pipewire.defaultUrl).replace(PATTERNS.pipewire.trailingSlashes, "");
+
+    function clearGrace() {
+        if (graceTimer != null) clearTimeout(graceTimer);
+        graceTimer = null;
+    }
 
     function emit(streaming: boolean) {
-        if (streaming !== lastStreaming) {
-            lastStreaming = streaming;
-            onStateChange(streaming);
+        clearGrace();
+        if (streaming === lastStreaming) return;
+        lastStreaming = streaming;
+        onStateChange(streaming);
+    }
+
+    function lost() {
+        if (!lastStreaming) emit(false);
+        else if (graceTimer == null) graceTimer = setTimeout(() => {
+            graceTimer = null;
+            emit(false);
+        }, DISCONNECT_GRACE_MS);
+    }
+
+    async function fetchStatus(): Promise<boolean | null> {
+        fetchAbort?.abort();
+        const abort = fetchAbort = new AbortController();
+        try {
+            const res = await fetch(baseUrl() + PATTERNS.pipewire.statusPath, { cache: "no-store", signal: abort.signal });
+            if (!res.ok) return false;
+            return readStreaming(await res.json()) ?? false;
+        } catch (err) {
+            if (!abort.signal.aborted) logger.debug("PipeWire helper not reachable", err);
+            return null;
+        } finally {
+            if (fetchAbort === abort) fetchAbort = null;
         }
     }
 
-    /** Polls /status while the event stream is down; only one poll loop runs at a time. */
     function startPolling() {
-        if (active && !eventSource && pollTimer == null) pollStatus();
+        if (running && !eventSource && pollTimer == null && !polling) pollStatus();
     }
 
     async function pollStatus() {
         pollTimer = null;
-        if (!active || eventSource) return;
-        let reachable = false;
+        polling = true;
         try {
-            const res = await fetch(`${baseUrl()}/status`, { cache: "no-store" });
-            reachable = true;
-            emit(res.ok && Boolean((await res.json()).streaming));
-        } catch {
-            emit(false);
+            const streaming = await fetchStatus();
+            if (!running || eventSource) return;
+            if (streaming === null) lost();
+            else {
+                pollBackoff.reset();
+                emit(streaming);
+            }
+        } finally {
+            polling = false;
+            if (running && !eventSource) pollTimer = setTimeout(pollStatus, pollBackoff.next());
         }
-        if (reachable) pollBackoff.reset();
-        if (active && !eventSource) pollTimer = setTimeout(pollStatus, pollBackoff.next());
+    }
+
+    function stopPolling() {
+        if (pollTimer != null) clearTimeout(pollTimer);
+        pollTimer = null;
+        fetchAbort?.abort();
     }
 
     function connectSSE() {
         sseTimer = null;
-        if (!active) return;
+        if (!running) return;
+        let source: EventSource;
         try {
-            eventSource = new EventSource(`${baseUrl()}/events`);
-        } catch {
-            eventSource = null;
+            source = new EventSource(baseUrl() + PATTERNS.pipewire.eventsPath);
+        } catch (err) {
+            logger.warn("Can't connect to the PipeWire helper", err);
             startPolling();
+            sseTimer = setTimeout(connectSSE, sseBackoff.next());
             return;
         }
+        eventSource = source;
 
-        eventSource.onopen = () => {
+        source.onopen = async () => {
+            if (eventSource !== source) return;
             sseBackoff.reset();
             pollBackoff.reset();
-            if (pollTimer != null) {
-                clearTimeout(pollTimer);
-                pollTimer = null;
-            }
+            stopPolling();
+            const streaming = await fetchStatus();
+            if (eventSource === source && streaming !== null) emit(streaming);
         };
 
-        eventSource.onmessage = event => {
+        source.onmessage = event => {
+            if (eventSource !== source || typeof event.data !== "string") return;
             try {
-                const data = JSON.parse(event.data);
-                if (data && typeof data.streaming === "boolean") {
-                    emit(data.streaming);
-                }
-            } catch {
-                // Ignore keepalive or malformed data
+                const streaming = readStreaming(JSON.parse(event.data));
+                if (streaming !== null) emit(streaming);
+            } catch (err) {
+                logger.debug("Ignoring a malformed PipeWire event", err);
             }
         };
 
-        eventSource.onerror = () => {
-            eventSource?.close();
+        source.onerror = () => {
+            if (eventSource !== source) return;
+            source.close();
             eventSource = null;
-            emit(false);
+            lost();
             startPolling();
-            if (active && sseTimer == null) sseTimer = setTimeout(connectSSE, sseBackoff.next());
+            if (running && sseTimer == null) sseTimer = setTimeout(connectSSE, sseBackoff.next());
         };
     }
 
     connectSSE();
 
-    return () => {
-        active = false;
-        eventSource?.close();
-        eventSource = null;
-        if (pollTimer != null) clearTimeout(pollTimer);
-        if (sseTimer != null) clearTimeout(sseTimer);
-        pollTimer = null;
-        sseTimer = null;
-        emit(false);
+    return {
+        stop() {
+            running = false;
+            eventSource?.close();
+            eventSource = null;
+            stopPolling();
+            if (sseTimer != null) clearTimeout(sseTimer);
+            sseTimer = null;
+            emit(false);
+        },
+        retryNow() {
+            if (!running || eventSource) return;
+            if (sseTimer != null) {
+                clearTimeout(sseTimer);
+                connectSSE();
+            }
+        }
     };
 }
